@@ -1,0 +1,140 @@
+clc; 
+clear all;
+%matlab是R2024b 版本 可以在https://mp.weixin.qq.com/s/5IutbJm-5o_SZLwpH1iA8w安装
+
+% 修改为SPEI数据路径
+imgdirX = 'D:\Codes\Geo_SPEI\'; 
+addpath(genpath(imgdirX));
+
+% 读取SPEI数据
+filenamesX = dir([imgdirX '*.tif']);
+for ii = 1:numel(filenamesX)
+    A = imread(filenamesX(ii).name);  % 读取tif文件
+    X(:,:,ii) = A;  % 将每张图像按顺序存储到三维矩阵X中
+end
+
+% 修改为NDVI数据路径
+imgdirY = 'D:\Codes\GEO_NDVI\'; 
+addpath(genpath(imgdirY));
+
+% 读取NDVI数据
+filenamesY = dir([imgdirY '*.tif']);
+for ii = 1:numel(filenamesY)
+    [da,R]= geotiffread(filenamesY(ii).name);
+    A = imread(filenamesY(ii).name);  % 读取tif文件
+    Y(:,:,ii) = A;  % 将每张图像按顺序存储到三维矩阵Y中
+end
+
+% 去除异常值
+X(X == -9999) = nan;
+Y(Y == -9999) = nan;
+X(isinf(X)) = nan;
+Y(isinf(Y)) = nan;
+
+[rows, cols, depth] = size(X);
+
+% 请确认数据的行列是否正确，若反了需要自己翻转
+% 初始化一个空矩阵，用于存储结果数据
+dryhot = nan(rows, cols);  % 初始化结果矩阵
+
+% % 计算前5%的数据
+row_end = round(rows);   
+col_end = round(cols);  
+
+% 循环遍历的像元
+%这里是并行计算
+parfor i = 1:row_end
+    for j = 1:col_end
+        X1 = X(i, j, :);  % 获取第i行第j列的所有时间序列数据
+        Y1 = Y(i, j, :);  % 获取第i行第j列的所有时间序列数据
+
+        p = X1(:);p=double(p);
+        t = Y1(:);t=double(t);
+
+        if all(isnan(p)) || all(isnan(t))||numel(p) == sum(p == p(1)) || numel(t) == sum(t == t(1))
+            PP = nan;  % 如果全部为NaN，则结果为NaN
+        else
+            index = ~isnan(p) & ~isnan(t);  % 过滤掉NaN值
+            X1 = p(index);
+            Y1 = t(index);
+
+            % 阈值计算,改这里即可
+            % 表示中度干旱-1.5 < SPEI < -1
+            phighth = -1;
+            plowth = -1.5;
+            tth = quantile(Y1, 0.4);  % 表示植被的40%分位数
+  try
+            %[D_U1, PD_U1] = marginfitdist(X1);  % 拟合X1的边缘分布
+
+            % 使用 fitdist 进行正态分布拟合
+            pd_X1 = fitdist(X1, 'Normal');  % 拟合 X1 数据为正态分布
+            % 保存拟合结果
+            D_U1 = struct('DistName', 'Normal', 'Params', pd_X1.Params);  % 将分布类型和参数保存在 D_U1
+            PD_U1 = {pd_X1};  % 将拟合后的正态分布对象保存到 PD_U1
+            
+            [D_U2, PD_U2] = marginfitdist(Y1);  % 拟合Y1的边缘分布
+
+            % 拟合最佳边缘分布
+            EP1 = cdf(PD_U1{1}, X1);  % 计算X1的CDF
+            EP2 = cdf(PD_U2{1}, Y1);  % 计算Y1的CDF
+
+            % 阈值的分布计算
+            phighth = cdf(PD_U1{1}, phighth);
+            plowth = cdf(PD_U1{1}, plowth);
+            tth = cdf(PD_U2{1}, tth);
+
+            EP12 = [EP1 EP2];
+            EP12(EP12 <= 0) = 1e-4;  % 防止CDF为0，避免后续计算错误
+            [Family1, thetahat1, loglik1] = doublecopulaselect(EP12, 'aic');  % 选择最佳的copula模型
+
+            % 设置阈值
+            EPpthigh = [phighth tth];
+            EPptlow = [plowth tth];
+            EPpthigh(EPpthigh <= 1e-4)=1e-4;
+            EPptlow(EPptlow <= 1e-4)=1e-4;
+            % 计算二维的条件概率
+            %表示大于一个数和小于一个数的范围比如中度干旱（-1.5 < SPEI ≤ -1.0）
+            ptor = (copulascdf(EPpthigh, Family1, thetahat1) - copulascdf(EPptlow, Family1, thetahat1)) / (phighth - plowth);
+            %表示小于一个数范围，比如 SPEI ≤ -1.5
+            %ptor =copulascdf(EPpthigh, Family1, thetahat1)/ phighth;
+            %表示大于一个数范围，比如SPEI > 1.5
+            %ptor = (EPpthigh-copulascdf(EPpthigh, Family1, thetahat1)) / (1 - plowth);
+            
+          % 如果计算失败，设置PP为NaN
+                if isnan(ptor) || isinf(ptor)
+                    PP = nan;  % 如果ptor为NaN或无穷大，跳过该像元
+                else
+                    PP = ptor;  % 计算结果
+                end
+
+            catch
+                % 如果在try块中发生错误，设置PP为NaN并跳过该像元
+                PP = nan;
+            end
+        end
+        %disp(PP)  % 显示计算结果
+        dryhot(i, j) = PP;  % 将计算结果存储到结果矩阵
+    end
+    
+    % 更新进度信息
+    fprintf('Processing row %d of %d...\n', i, row_end);  % 显示当前行处理进度
+end
+
+% 将结果矩阵dryhot保存为tif格式
+outputDir = 'D:\desktop\大论文\result\';  % 修改为你希望保存结果的路径
+outputFileName = 'Result.tif';  % 保存的文件名
+outputPath = fullfile(outputDir, outputFileName);
+
+% 确保输出文件夹存在
+if ~exist(outputDir, 'dir')
+    mkdir(outputDir);  % 如果文件夹不存在，创建它
+end
+
+% 由于dryhot可能包含NaN值，首先用nan填充，使用uint16格式保存数据
+dryhot(isnan(dryhot)) = 0;  % 将NaN替换为0，避免保存为tif时出现问题
+dryhot(dryhot>=1) = 0.98;
+dryhot(dryhot<=0) = 0;
+% 保存为.tif文件
+
+geotiffwrite(outputPath,dryhot,R);
+disp(['Result saved to: ', outputPath]);

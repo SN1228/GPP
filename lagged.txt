@@ -1,0 +1,259 @@
+clc; clear; close all;
+%% ========== 1. 参数配置 ==========
+path_npp  = 'E:\2GPP_drought\data\PML_GPP\YM_mm_china_PML\';
+path_spei = 'E:\2GPP_drought\data\drought_index\SPEI\china\month_SPEI\spei1\';
+out_dir   = 'C:\Users\48063\Desktop\Drought\修订版时滞与累积效应\';
+[aa, R] = geotiffread(fullfile(path_npp, '2001_01.tif'));
+info = geotiffinfo(fullfile(path_npp, '2001_01.tif'));
+[m, n] = size(aa);
+begin_year = 2001; end_year = 2023;
+years = begin_year:end_year;
+months = 1:12;
+total_months = length(years) * length(months);
+NPP_ts  = nan(m*n, total_months);
+SPEI_ts = nan(m*n, total_months);
+%% ========== 2. 加载数据 ==========
+fprintf('正在加载数据...\n');
+k = 1;
+for y = years
+    for mth = months
+        f_npp = sprintf('%s%d_%02d.tif', path_npp, y, mth);
+        if exist(f_npp, 'file')
+            tmp = geotiffread(f_npp);
+            tmp(tmp < 0) = NaN;
+            NPP_ts(:, k) = tmp(:);
+        end
+        
+        f1 = sprintf('%s%d_%02d.tif', path_spei, y, mth);
+        f2 = sprintf('%s%d_%d.tif', path_spei, y, mth);
+        if exist(f1, 'file')
+            tmp_s = geotiffread(f1);
+        elseif exist(f2, 'file')
+            tmp_s = geotiffread(f2);
+        else
+            tmp_s = nan(m, n);
+        end
+        tmp_s(tmp_s > 6 | tmp_s < -6) = NaN;
+        SPEI_ts(:, k) = tmp_s(:);
+        k = k + 1;
+    end
+end
+fprintf('数据加载完成。\n');
+%% ========== 3. 滞后相关（含有效自由度修正） ==========
+max_lag = 12;
+R_layers = nan(m*n, max_lag+1);
+P_layers = nan(m*n, max_lag+1);
+Neff_layers = nan(m*n, max_lag+1);  % 【新增】存储有效自由度
+fprintf('正在计算考虑自相关修正的滞后相关...\n');
+for lag = 0:max_lag
+    idx_npp  = (lag+1):total_months;
+    idx_spei = 1:(total_months - lag);
+    
+    for i = 1:m*n
+        y = NPP_ts(i, idx_npp);
+        x = SPEI_ts(i, idx_spei);
+        mask = ~isnan(x) & ~isnan(y);
+        if sum(mask) > 30
+            x_val = zscore(detrend(x(mask)));
+            y_val = zscore(detrend(y(mask)));
+            
+            r = corr(x_val(:), y_val(:));
+            
+            r1_x = corr(x_val(1:end-1)', x_val(2:end)');
+            r1_y = corr(y_val(1:end-1)', y_val(2:end)');
+            if isnan(r1_x), r1_x = 0; end
+            if isnan(r1_y), r1_y = 0; end
+            
+            N = length(x_val);
+            n_eff = N * (1 - r1_x * r1_y) / (1 + r1_x * r1_y);
+            n_eff = max(min(n_eff, N), 3);
+            Neff_layers(i, lag+1) = n_eff;  % 【新增】存下来
+            
+            t_stat = r * sqrt((n_eff - 2) / (1 - r^2));
+            p = 2 * tcdf(-abs(t_stat), n_eff - 2);
+            
+            R_layers(i, lag+1) = r;
+            P_layers(i, lag+1) = p;
+        end
+    end
+    if mod(lag, 3) == 0
+        fprintf('  已完成滞后 %d 个月的计算。\n', lag);
+    end
+end
+%% ========== 4. 双版本提取 ==========
+% 版本A（主结果）：有效自由度校正 p < 0.05
+R_max_A = nan(m*n, 1);
+P_final_A = nan(m*n, 1);
+Lag_val_A = nan(m*n, 1);
+% 版本B（补充材料）：BH-FDR q < 0.05
+R_max_B = nan(m*n, 1);
+P_final_B = nan(m*n, 1);
+Lag_val_B = nan(m*n, 1);
+q_threshold = 0.05;
+fprintf('正在提取双版本结果...\n');
+for i = 1:m*n
+    p_vals = P_layers(i, :);
+    valid = ~isnan(p_vals);
+    n_valid = sum(valid);
+    
+    if n_valid >= 2
+        valid_positions = find(valid)';       % 列向量，如 [2; 5; 7; 9]
+        p_sub = p_vals(valid_positions)';       % 列向量
+        m_p = length(p_sub);
+        
+        % ===== 版本A：有效自由度校正 p < 0.05（主结果）=====
+        sig_idx_A = find(p_sub < 0.05);         % 在p_sub中的索引位置
+        if ~isempty(sig_idx_A)
+            sig_positions_A = valid_positions(sig_idx_A);  % 对应的原始滞后月位置
+            [~, pos] = max(abs(R_layers(i, sig_positions_A')));
+            best_lag = sig_positions_A(pos);
+            R_max_A(i) = R_layers(i, best_lag);
+            P_final_A(i) = p_sub(sig_idx_A(pos));
+            Lag_val_A(i) = best_lag - 1;
+        end
+        
+        % ===== 版本B：BH-FDR q < 0.05（补充材料）=====
+        [p_sorted, sort_idx] = sort(p_sub);
+        qvals = p_sorted .* m_p ./ ((1:m_p)');
+        for j = m_p-1:-1:1
+            qvals(j) = min(qvals(j), qvals(j+1));
+        end
+        
+        q_original = nan(m_p, 1);
+        for kk = 1:m_p
+            q_original(sort_idx(kk)) = qvals(kk);
+        end
+        
+        sig_idx_B = find(q_original < q_threshold);
+        if ~isempty(sig_idx_B)
+            sig_positions_B = valid_positions(sig_idx_B);
+            [~, pos] = max(abs(R_layers(i, sig_positions_B')));
+            best_lag = sig_positions_B(pos);
+            R_max_B(i) = R_layers(i, best_lag);
+            P_final_B(i) = q_original(sig_idx_B(pos));
+            Lag_val_B(i) = best_lag - 1;
+        end
+    end
+end
+% 统计
+total_pix = sum(any(~isnan(R_layers), 2));
+sig_A = sum(~isnan(R_max_A));
+sig_B = sum(~isnan(R_max_B));
+%% ========== 4. 双版本提取 ==========
+% ... 原有代码保持不变 ...
+fprintf('=== 显著性统计 ===\n');
+fprintf('有数据的像元数: %d\n', total_pix);
+fprintf('版本A (p_eff<0.05, 主结果): %d (%.1f%%)\n', sig_A, sig_A/total_pix*100);
+fprintf('版本B (FDR q<0.05, 补充材料): %d (%.1f%%)\n', sig_B, sig_B/total_pix*100);
+fprintf('\n--- n_eff 诊断 ---\n');
+all_neff = Neff_layers(:);
+all_neff = all_neff(~isnan(all_neff));
+fprintf('n_eff 中位数: %.1f\n', median(all_neff));
+fprintf('n_eff < 10 的比例: %.2f%%\n', sum(all_neff < 10)/length(all_neff)*100);
+fprintf('n_eff = 3(截断下限)的比例: %.2f%%\n', sum(all_neff == 3)/length(all_neff)*100);
+%% ========== 【新增】诊断分析 ==========
+fprintf('\n========== 诊断分析 ==========\n');
+% 1. 随机抽样看详细结果
+sample_idx = randi(m*n, 10, 1);  % 随机抽10个像元
+fprintf('\n--- 1. 随机像元抽样诊断 ---\n');
+for i = sample_idx'
+    p_vals = P_layers(i, :);
+    r_vals = R_layers(i, :);
+    valid = ~isnan(p_vals);
+    
+    fprintf('\n像元 %d (有效滞后月: %d):\n', i, sum(valid));
+    fprintf('  R值: '); fprintf('%.3f ', r_vals); fprintf('\n');
+    fprintf('  P值: '); fprintf('%.4f ', p_vals); fprintf('\n');
+    fprintf('  最小P值: %.4f, 最大|R|: %.3f\n', ...
+        min(p_vals, [], 'omitnan'), max(abs(r_vals), [], 'omitnan'));
+    
+    % 看版本A的结果
+    if ~isnan(R_max_A(i))
+        fprintf('  → 版本A显著: lag=%d, r=%.3f, p=%.4f\n', ...
+            Lag_val_A(i), R_max_A(i), P_final_A(i));
+    else
+        fprintf('  → 版本A: 无显著结果\n');
+    end
+end
+% 2. P值整体分布统计
+fprintf('\n--- 2. P值分布统计 ---\n');
+all_p = P_layers(:);
+all_p = all_p(~isnan(all_p));
+fprintf('所有滞后-像元组合总数: %d\n', length(all_p));
+fprintf('P < 0.05 的比例: %.2f%%\n', sum(all_p < 0.05)/length(all_p)*100);
+fprintf('P < 0.01 的比例: %.2f%%\n', sum(all_p < 0.01)/length(all_p)*100);
+fprintf('P值中位数: %.4f\n', median(all_p));
+fprintf('P值范围: %.4f ~ %.4f\n', min(all_p), max(all_p));
+% 3. 有效滞后月数分布
+fprintf('\n--- 3. 有效滞后月数分布 ---\n');
+n_valid_per_pix = sum(~isnan(P_layers), 2);
+fprintf('每个像元平均有效滞后月: %.1f\n', mean(n_valid_per_pix));
+fprintf('有效滞后月 < 5 的像元: %d\n', sum(n_valid_per_pix < 5));
+% 4. 相关系数分布
+fprintf('\n--- 4. 相关系数分布 ---\n');
+all_r = R_layers(:);
+all_r = all_r(~isnan(all_r));
+fprintf('R值范围: %.3f ~ %.3f\n', min(all_r), max(all_r));
+fprintf('|R| > 0.3 的比例: %.2f%%\n', sum(abs(all_r) > 0.3)/length(all_r)*100);
+%% ========== 5. 统计汇总与诊断输出 ==========
+% --- 5.1 滞后月数分布统计 ---
+lag_A = Lag_val_A(~isnan(Lag_val_A));
+lag_B = Lag_val_B(~isnan(Lag_val_B));
+count_A = histcounts(lag_A, -0.5:12.5);
+count_B = histcounts(lag_B, -0.5:12.5);
+pct_A = count_A / sum(count_A) * 100;
+pct_B = count_B / sum(count_B) * 100;
+fprintf('\n--- 滞后月数分布 ---\n');
+fprintf('版本A (p<0.05): 总像元 %d\n', length(lag_A));
+for k = 0:12
+    fprintf('  滞后%2d月: %6d 像元 (%.1f%%)\n', k, count_A(k+1), pct_A(k+1));
+end
+fprintf('版本B (FDR): 总像元 %d\n', length(lag_B));
+for k = 0:12
+    fprintf('  滞后%2d月: %6d 像元 (%.1f%%)\n', k, count_B(k+1), pct_B(k+1));
+end
+% --- 5.2 绘图 ---
+figure('Color','w', 'Position', [100 100 900 500]);
+b = bar(0:12, [pct_A; pct_B]', 1.2);
+b(1).FaceColor = [0.3 0.6 0.9];  % A版蓝色
+b(2).FaceColor = [0.2 0.7 0.4];  % B版绿色
+set(gca, 'XTick', 0:12, 'FontSize', 11, 'XLim', [-1 13]);
+xlabel('最佳滞后月数', 'FontSize', 13);
+ylabel('像元比例 (%)', 'FontSize', 13);
+legend('版本A (p_{eff}<0.05)', '版本B (FDR q<0.05)', 'Location', 'best');
+title('显著像元的最佳滞后月数分布', 'FontSize', 14);
+saveas(gcf, fullfile(out_dir, '滞后月数统计汇总.png'));
+% --- 5.3 相关系数范围统计（补充材料用） ---
+r_A = R_max_A(~isnan(R_max_A));
+r_B = R_max_B(~isnan(R_max_B));
+fprintf('\n--- 相关系数统计 ---\n');
+fprintf('版本A |r| 中位数: %.3f, 范围: %.3f ~ %.3f\n', ...
+    median(abs(r_A)), min(r_A), max(r_A));
+fprintf('版本B |r| 中位数: %.3f, 范围: %.3f ~ %.3f\n', ...
+    median(abs(r_B)), min(r_B), max(r_B));
+fprintf('\n========== 诊断结束 ==========\n');
+%% ========== 5. 输出 GeoTIFF ==========
+% ... 原有代码继续 ...
+%% ========== 5. 输出 GeoTIFF ==========
+if ~exist(out_dir, 'dir')
+    mkdir(out_dir);
+end
+% 版本A（主结果）
+geotiffwrite(fullfile(out_dir, 'A_最大滞后相关系数.tif'), reshape(R_max_A, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'A_滞后月数.tif'), reshape(Lag_val_A, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'A_P值.tif'), reshape(P_final_A, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'A_显著性标记.tif'), reshape(double(~isnan(R_max_A)), m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+% 版本B（补充材料）
+geotiffwrite(fullfile(out_dir, 'B_FDR_最大滞后相关系数.tif'), reshape(R_max_B, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'B_FDR_滞后月数.tif'), reshape(Lag_val_B, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'B_FDR_P值.tif'), reshape(P_final_B, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'B_FDR_显著性标记.tif'), reshape(double(~isnan(R_max_B)), m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+fprintf('✅ 所有计算完成！\n');

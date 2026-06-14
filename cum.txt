@@ -1,0 +1,219 @@
+clc; clear; close all;
+%% ========== 1. 参数配置 ==========
+path_npp  = 'E:\2GPP_drought\data\PML_GPP\YM_mm_china_PML\';
+path_spei = 'E:\2GPP_drought\data\drought_index\SPEI\china\month_SPEI\';
+out_dir   = 'C:\Users\48063\Desktop\Drought\修订版时滞与累积效应\';
+% 自动检测投影参考文件（兼容 2001_1.tif 和 2001_01.tif 两种命名）
+f_proj1 = fullfile(path_npp, '2001_1.tif');
+f_proj2 = fullfile(path_npp, '2001_01.tif');
+if exist(f_proj1, 'file')
+    [aa, R] = geotiffread(f_proj1);
+    info = geotiffinfo(f_proj1);
+elseif exist(f_proj2, 'file')
+    [aa, R] = geotiffread(f_proj2);
+    info = geotiffinfo(f_proj2);
+else
+    error('无法找到投影参考文件，请检查路径：%s', path_npp);
+end
+[m, n] = size(aa);
+begin_year = 2001;
+end_year = 2023;
+begin_month = 1;
+end_month = 12;
+len_y = end_year - begin_year + 1;
+len_m = end_month - begin_month + 1;
+total_months = len_y * len_m;
+max_scale = 12;  % SPEI最大累积尺度
+%% ========== 2. 加载GPP数据 ==========
+fprintf('正在加载GPP数据...\n');
+npp_sum = nan(m*n, total_months);
+k1 = 1;
+for year = begin_year:end_year
+    for month1 = begin_month:end_month
+        % 兼容 2001_1.tif 和 2001_01.tif 两种命名
+        f_npp1 = fullfile(path_npp, [int2str(year), '_', int2str(month1), '.tif']);
+        f_npp2 = fullfile(path_npp, [int2str(year), '_', sprintf('%02d', month1), '.tif']);
+        if exist(f_npp1, 'file')
+            npp = geotiffread(f_npp1);
+        elseif exist(f_npp2, 'file')
+            npp = geotiffread(f_npp2);
+        else
+            npp = nan(m, n);
+        end
+        npp(npp < 0) = NaN;
+        npp_sum(:, k1) = npp(:);
+        k1 = k1 + 1;
+    end
+end
+fprintf('GPP数据加载完成。\n');
+%% ========== 3. 累积相关（含有效自由度修正） ==========
+R_layers = nan(m*n, max_scale);  % 存储12个尺度的相关系数
+P_layers = nan(m*n, max_scale);  % 存储12个尺度的p值
+fprintf('正在计算考虑自相关修正的累积相关...\n');
+for I_mon = 1:max_scale
+    fprintf('  正在计算SPEI-%02d...\n', I_mon);
+    
+    % 加载当前累积尺度的SPEI
+    spei_sum = nan(m*n, total_months);
+    k2 = 1;
+    for year = begin_year:end_year
+        for month2 = begin_month:end_month
+            % 兼容 2001_1.tif 和 2001_01.tif 两种命名
+            f_spei1 = fullfile(path_spei, ['spei', int2str(I_mon)], [int2str(year), '_', int2str(month2), '.tif']);
+            f_spei2 = fullfile(path_spei, ['spei', int2str(I_mon)], [int2str(year), '_', sprintf('%02d', month2), '.tif']);
+            if exist(f_spei1, 'file')
+                spei = geotiffread(f_spei1);
+            elseif exist(f_spei2, 'file')
+                spei = geotiffread(f_spei2);
+            else
+                spei = nan(m, n);
+            end
+            spei(spei > 6 | spei < -6) = NaN;
+            spei_sum(:, k2) = spei(:);
+            k2 = k2 + 1;
+        end
+    end
+    
+    % 逐像元计算相关
+    for i = 1:m*n
+        y = npp_sum(i, :);
+        x = spei_sum(i, :);
+        mask = ~isnan(x) & ~isnan(y);
+        
+        if sum(mask) > 30
+            y_val = zscore(detrend(y(mask)'));
+            x_val = zscore(detrend(x(mask)'));
+            
+            r = corr(x_val(:), y_val(:));
+            
+            % 有效自由度校正
+            r1_x = corr(x_val(1:end-1)', x_val(2:end)');
+            r1_y = corr(y_val(1:end-1)', y_val(2:end)');
+            if isnan(r1_x), r1_x = 0; end
+            if isnan(r1_y), r1_y = 0; end
+            
+            N = length(x_val);
+            n_eff = N * (1 - r1_x * r1_y) / (1 + r1_x * r1_y);
+            n_eff = max(min(n_eff, N), 3);
+            
+            t_stat = r * sqrt((n_eff - 2) / (1 - r^2));
+            p = 2 * tcdf(-abs(t_stat), n_eff - 2);
+            
+            R_layers(i, I_mon) = r;
+            P_layers(i, I_mon) = p;
+        end
+    end
+end
+fprintf('累积相关计算完成。\n');
+%% ========== 4. 双版本提取 ==========
+% 版本A（主结果）：有效自由度校正 p < 0.05
+R_max_A = nan(m*n, 1);
+P_final_A = nan(m*n, 1);
+Scale_val_A = nan(m*n, 1);  % 最佳累积尺度（1-12）
+% 版本B（补充材料）：BH-FDR q < 0.05
+R_max_B = nan(m*n, 1);
+P_final_B = nan(m*n, 1);
+Scale_val_B = nan(m*n, 1);
+q_threshold = 0.05;
+fprintf('正在提取双版本结果...\n');
+for i = 1:m*n
+    p_vals = P_layers(i, :);
+    valid = ~isnan(p_vals);
+    n_valid = sum(valid);
+    
+    if n_valid >= 2
+        valid_positions = find(valid)';       % 列向量
+        p_sub = p_vals(valid_positions)';       % 列向量
+        m_p = length(p_sub);
+        
+        % ===== 版本A：有效自由度校正 p < 0.05（主结果）=====
+        sig_idx_A = find(p_sub < 0.05);
+        if ~isempty(sig_idx_A)
+            sig_positions_A = valid_positions(sig_idx_A);
+            [~, pos] = max(abs(R_layers(i, sig_positions_A')));
+            best_scale = sig_positions_A(pos);
+            R_max_A(i) = R_layers(i, best_scale);
+            P_final_A(i) = p_sub(sig_idx_A(pos));
+            Scale_val_A(i) = best_scale;  % 1-12
+        end
+        
+        % ===== 版本B：BH-FDR q < 0.05（补充材料）=====
+        [p_sorted, sort_idx] = sort(p_sub);
+        qvals = p_sorted .* m_p ./ ((1:m_p)');
+        for j = m_p-1:-1:1
+            qvals(j) = min(qvals(j), qvals(j+1));
+        end
+        
+        q_original = nan(m_p, 1);
+        for kk = 1:m_p
+            q_original(sort_idx(kk)) = qvals(kk);
+        end
+        
+        sig_idx_B = find(q_original < q_threshold);
+        if ~isempty(sig_idx_B)
+            sig_positions_B = valid_positions(sig_idx_B);
+            [~, pos] = max(abs(R_layers(i, sig_positions_B')));
+            best_scale = sig_positions_B(pos);
+            R_max_B(i) = R_layers(i, best_scale);
+            P_final_B(i) = q_original(sig_idx_B(pos));
+            Scale_val_B(i) = best_scale;
+        end
+    end
+end
+% 统计
+total_pix = sum(any(~isnan(R_layers), 2));
+sig_A = sum(~isnan(R_max_A));
+sig_B = sum(~isnan(R_max_B));
+fprintf('=== 显著性统计 ===\n');
+fprintf('有数据的像元数: %d\n', total_pix);
+fprintf('版本A (p_eff<0.05, 主结果): %d (%.1f%%)\n', sig_A, sig_A/total_pix*100);
+fprintf('版本B (FDR q<0.05, 补充材料): %d (%.1f%%)\n', sig_B, sig_B/total_pix*100);
+%% ========== 5. 统计汇总（累积尺度分布） ==========
+scale_A = Scale_val_A(~isnan(Scale_val_A));
+scale_B = Scale_val_B(~isnan(Scale_val_B));
+count_A = histcounts(scale_A, 0.5:12.5);
+count_B = histcounts(scale_B, 0.5:12.5);
+pct_A = count_A / sum(count_A) * 100;
+pct_B = count_B / sum(count_B) * 100;
+fprintf('\n--- 累积尺度分布 ---\n');
+fprintf('版本A (p<0.05): 总像元 %d\n', length(scale_A));
+for k = 1:12
+    fprintf('  SPEI-%02d: %6d 像元 (%.1f%%)\n', k, count_A(k), pct_A(k));
+end
+fprintf('版本B (FDR): 总像元 %d\n', length(scale_B));
+for k = 1:12
+    fprintf('  SPEI-%02d: %6d 像元 (%.1f%%)\n', k, count_B(k), pct_B(k));
+end
+figure('Color','w', 'Position', [100 100 900 500]);
+b = bar(1:12, [pct_A; pct_B]', 1.2);
+b(1).FaceColor = [0.3 0.6 0.9];
+b(2).FaceColor = [0.2 0.7 0.4];
+set(gca, 'XTick', 1:12, 'FontSize', 11, 'XLim', [0 13]);
+xlabel('最佳累积尺度（SPEI-月）', 'FontSize', 13);
+ylabel('像元比例 (%)', 'FontSize', 13);
+legend('版本A (p_{eff}<0.05)', '版本B (FDR q<0.05)', 'Location', 'best');
+title('显著像元的最佳累积尺度分布', 'FontSize', 14);
+saveas(gcf, fullfile(out_dir, '累积尺度统计汇总.png'));
+%% ========== 6. 输出 GeoTIFF ==========
+if ~exist(out_dir, 'dir')
+    mkdir(out_dir);
+end
+% 版本A（主结果）
+geotiffwrite(fullfile(out_dir, 'A_最大累积相关系数.tif'), reshape(R_max_A, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'A_累积月数.tif'), reshape(Scale_val_A, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'A_P值.tif'), reshape(P_final_A, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'A_显著性标记.tif'), reshape(double(~isnan(R_max_A)), m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+% 版本B（补充材料）
+geotiffwrite(fullfile(out_dir, 'B_FDR_最大累积相关系数.tif'), reshape(R_max_B, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'B_FDR_累积月数.tif'), reshape(Scale_val_B, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'B_FDR_P值.tif'), reshape(P_final_B, m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+geotiffwrite(fullfile(out_dir, 'B_FDR_显著性标记.tif'), reshape(double(~isnan(R_max_B)), m, n), R, ...
+    'GeoKeyDirectoryTag', info.GeoTIFFTags.GeoKeyDirectoryTag);
+fprintf('\n✅ 所有计算完成！\n');

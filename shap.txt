@@ -1,0 +1,387 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.model_selection import (
+    train_test_split, RandomizedSearchCV, KFold,
+    cross_val_score
+)
+from sklearn.feature_selection import RFECV, SelectFromModel  # 修正导入路径
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import xgboost as xgb
+from tqdm import tqdm
+from itertools import combinations
+
+# ==================== 0. 环境配置 ====================
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['axes.unicode_minus'] = False
+
+# 读取数据（请根据实际路径修改）
+data_file = r'C:\Users\48063\Desktop\Drought\最终版\YM16\因子统计\CHINA_Probability.csv'  # 或保留你的绝对路径
+data = pd.read_csv(data_file)
+
+features = ["TEM", "PRE", "SSR", "SM", "VPD", "WS"]
+target = "prob_2YM"
+X = data[features].apply(pd.to_numeric, errors='coerce')
+y = data[target]
+
+print(f"数据集大小: {X.shape[0]} 样本, {X.shape[1]} 个特征")
+print(f"目标变量范围: [{y.min():.4f}, {y.max():.4f}]")
+
+# 创建保存文件夹
+model_name = "XGBoost_Enhanced"
+base_dir = r'C:\Users\48063\Desktop\Drought\最终版\YM16\因子统计' # 请修改为实际输出路径，如 r'C:\Users\...\因子统计'
+folder = os.path.join(base_dir, model_name)
+os.makedirs(folder, exist_ok=True)
+
+# ==================== 1. 训练/测试分割（先分割，防泄漏） ====================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+print(f"\n训练集: {len(X_train)} | 测试集: {len(X_test)}")
+
+# ==================== 2. 特征选择（双重策略） ====================
+print("\n" + "="*50)
+print("【阶段一】特征选择")
+
+# 2.1 预训练模型获取初始重要性
+prelim_model = xgb.XGBRegressor(
+    n_estimators=100, max_depth=6, learning_rate=0.1,
+    random_state=42, n_jobs=-1, objective='reg:squarederror'
+)
+prelim_model.fit(X_train, y_train)
+
+importance_init = pd.DataFrame({
+    'Feature': features,
+    'Gain_Importance': prelim_model.feature_importances_
+}).sort_values('Gain_Importance', ascending=False)
+print("\n初始特征重要性 (Gain):")
+print(importance_init.to_string(index=False))
+
+# 2.2 RFECV：递归特征消除 + 交叉验证
+print("\n执行 RFECV (5折交叉验证递归特征消除)...")
+estimator_for_rfe = xgb.XGBRegressor(
+    n_estimators=100, max_depth=5, learning_rate=0.1,
+    random_state=42, n_jobs=-1, objective='reg:squarederror'
+)
+
+rfecv = RFECV(
+    estimator=estimator_for_rfe,
+    step=1,
+    cv=KFold(n_splits=5, shuffle=True, random_state=42),
+    scoring='neg_mean_squared_error',
+    n_jobs=-1
+)
+rfecv.fit(X_train, y_train)
+
+selected_features_rfecv = [f for f, s in zip(features, rfecv.support_) if s]
+print(f"RFECV 最优特征数量: {rfecv.n_features_}")
+print(f"RFECV 选定特征: {selected_features_rfecv}")
+
+# 2.3 SelectFromModel：基于中位数阈值
+selector = SelectFromModel(prelim_model, threshold='median')
+selector.fit(X_train, y_train)
+selected_features_sfm = [f for f, s in zip(features, selector.get_support()) if s]
+print(f"SelectFromModel (median) 选定特征: {selected_features_sfm}")
+
+# 2.4 最终特征集（以 RFECV 结果为准，若其选了全部则退化为全特征）
+final_features = selected_features_rfecv if len(selected_features_rfecv) >= 3 else features
+print(f"\n最终建模特征: {final_features}")
+
+X_train_final = X_train[final_features]
+X_test_final = X_test[final_features]
+
+# ==================== 3. 超参数调优（完整配置细节） ====================
+print("\n" + "="*50)
+print("【阶段二】超参数调优 (RandomizedSearchCV)")
+
+# 详细的超参数搜索空间
+param_distributions = {
+    'n_estimators': [100, 200, 300, 500, 700, 1000],
+    'max_depth': [3, 4, 5, 6, 8, 10, 12],
+    'learning_rate': [0.01, 0.03, 0.05, 0.1, 0.15, 0.2],
+    'subsample': [0.6, 0.7, 0.8, 0.9, 1.0],
+    'colsample_bytree': [0.6, 0.7, 0.8, 0.9, 1.0],
+    'reg_alpha': [0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0],      # L1 正则
+    'reg_lambda': [0.1, 0.5, 1.0, 2.0, 5.0, 10.0],         # L2 正则
+    'min_child_weight': [1, 3, 5, 7, 10],
+    'gamma': [0, 0.01, 0.1, 0.5, 1.0, 2.0]                 # 节点分裂惩罚
+}
+
+xgb_base = xgb.XGBRegressor(
+    random_state=42,
+    n_jobs=-1,
+    objective='reg:squarederror',
+    eval_metric='rmse'
+)
+
+# 验证策略：5折交叉验证
+inner_cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+random_search = RandomizedSearchCV(
+    estimator=xgb_base,
+    param_distributions=param_distributions,
+    n_iter=60,                    # 60次随机搜索，可按计算资源增减
+    scoring='neg_mean_squared_error',
+    cv=inner_cv,
+    verbose=1,
+    random_state=42,
+    n_jobs=-1,
+    return_train_score=True
+)
+
+random_search.fit(X_train_final, y_train)
+
+best_params = random_search.best_params_
+best_cv_score = random_search.best_score_
+
+print(f"\n>>> 最佳超参数组合:")
+for param, value in best_params.items():
+    print(f"    {param:20s}: {value}")
+print(f"\n>>> 最佳 5-Fold CV RMSE: {np.sqrt(-best_cv_score):.6f}")
+
+# 使用最佳参数重新初始化模型（确保完全可控）
+best_model = xgb.XGBRegressor(
+    n_estimators=best_params['n_estimators'],
+    max_depth=best_params['max_depth'],
+    learning_rate=best_params['learning_rate'],
+    subsample=best_params['subsample'],
+    colsample_bytree=best_params['colsample_bytree'],
+    reg_alpha=best_params['reg_alpha'],
+    reg_lambda=best_params['reg_lambda'],
+    min_child_weight=best_params['min_child_weight'],
+    gamma=best_params['gamma'],
+    random_state=42,
+    n_jobs=-1,
+    objective='reg:squarederror'
+)
+best_model.fit(X_train_final, y_train)
+
+# ==================== 4. 模型验证与评估 ====================
+print("\n" + "="*50)
+print("【阶段三】模型验证")
+
+# 4.1 独立测试集评估
+y_pred = best_model.predict(X_test_final)
+r2_test = r2_score(y_test, y_pred)
+rmse_test = np.sqrt(mean_squared_error(y_test, y_pred))
+mae_test = mean_absolute_error(y_test, y_pred)
+
+# 4.2 交叉验证评估（在训练集上做5折CV，报告均值±标准差）
+outer_cv = KFold(n_splits=5, shuffle=True, random_state=24)
+cv_r2 = cross_val_score(best_model, X_train_final, y_train, cv=outer_cv, scoring='r2', n_jobs=-1)
+cv_rmse = np.sqrt(-cross_val_score(best_model, X_train_final, y_train, cv=outer_cv,
+                                   scoring='neg_mean_squared_error', n_jobs=-1))
+
+print(f"\n独立测试集性能:")
+print(f"  R²   = {r2_test:.4f}")
+print(f"  RMSE = {rmse_test:.4f}")
+print(f"  MAE  = {mae_test:.4f}")
+
+print(f"\n5折交叉验证性能 (训练集):")
+print(f"  R²   = {cv_r2.mean():.4f} (+/- {cv_r2.std():.4f})")
+print(f"  RMSE = {cv_rmse.mean():.4f} (+/- {cv_rmse.std():.4f})")
+
+# ==================== 5. 结果保存（含完整配置文档） ====================
+print("\n" + "="*50)
+print("【阶段四】保存结果与配置文档")
+
+# 5.1 保存完整模型配置报告
+config_report = f"""================================================================================
+                     XGBoost 模型完整配置与验证报告
+================================================================================
+1. 数据概况
+   - 总样本量: {len(data):,}
+   - 特征变量: {', '.join(features)}
+   - 目标变量: {target}
+   - 特征选择后变量: {', '.join(final_features)}
+   - 训练集/测试集分割比例: 80% / 20%
+   - 随机种子: 42
+
+2. 特征选择策略
+   - 方法: RFECV (Recursive Feature Elimination with Cross-Validation)
+   - 基学习器: XGBRegressor
+   - 交叉验证: 5-Fold KFold (shuffle=True, random_state=42)
+   - 评分指标: Neg-MSE
+   - RFECV 最优特征数: {rfecv.n_features_}
+   - 最终入选特征: {', '.join(final_features)}
+
+3. 超参数调优详情
+   - 搜索方法: RandomizedSearchCV
+   - 搜索轮数: 60
+   - 交叉验证: 5-Fold KFold (shuffle=True, random_state=42)
+   - 参数空间:
+"""
+for param, values in param_distributions.items():
+    config_report += f"       {param:20s}: {values}\n"
+
+config_report += f"""
+   - 最优参数:
+"""
+for param, value in best_params.items():
+    config_report += f"       {param:20s}: {value}\n"
+
+config_report += f"""
+4. 验证策略说明
+   - 超参数优化验证: 5折交叉验证 (防止过拟合与选择偏误)
+   - 模型性能验证: 独立测试集 (20% hold-out) + 5折交叉验证双重验证
+   - 此策略确保模型泛化能力评估无数据泄漏
+
+5. 性能评估结果
+   ┌─────────────────┬──────────┬──────────────┐
+   │     指标        │ 测试集   │ 5折CV (均值) │
+   ├─────────────────┼──────────┼──────────────┤
+   │ R²              │ {r2_test:.4f}   │ {cv_r2.mean():.4f}        │
+   │ RMSE            │ {rmse_test:.4f}   │ {cv_rmse.mean():.4f}        │
+   │ MAE             │ {mae_test:.4f}   │ --           │
+   └─────────────────┴──────────┴──────────────┘
+   - CV R² 标准差: {cv_r2.std():.4f}
+   - CV RMSE 标准差: {cv_rmse.std():.4f}
+
+6. 模型配置代码片段 (可直接复现)
+   model = xgb.XGBRegressor(
+       n_estimators={best_params['n_estimators']},
+       max_depth={best_params['max_depth']},
+       learning_rate={best_params['learning_rate']},
+       subsample={best_params['subsample']},
+       colsample_bytree={best_params['colsample_bytree']},
+       reg_alpha={best_params['reg_alpha']},
+       reg_lambda={best_params['reg_lambda']},
+       min_child_weight={best_params['min_child_weight']},
+       gamma={best_params['gamma']},
+       random_state=42,
+       n_jobs=-1,
+       objective='reg:squarederror'
+   )
+================================================================================
+"""
+
+config_path = os.path.join(folder, "model_config.txt")
+with open(config_path, "w", encoding="utf-8") as f:
+    f.write(config_report)
+print(f"配置报告已保存: {config_path}")
+
+# 5.2 预测 vs 观测散点图
+plt.figure(figsize=(6, 6))
+sns.scatterplot(x=y_test, y=y_pred, alpha=0.3, s=20, edgecolor=None)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2, label='1:1 Line')
+plt.xlabel(f"Observed {target}", fontsize=12)
+plt.ylabel(f"Predicted {target}", fontsize=12)
+plt.text(0.05, 0.95, f"R² = {r2_test:.4f}", ha='left', va='top',
+         transform=plt.gca().transAxes, fontsize=11)
+plt.text(0.05, 0.88, f"RMSE = {rmse_test:.4f}", ha='left', va='top',
+         transform=plt.gca().transAxes, fontsize=11)
+plt.text(0.05, 0.81, f"MAE = {mae_test:.4f}", ha='left', va='top',
+         transform=plt.gca().transAxes, fontsize=11)
+plt.text(0.05, 0.74, f"5-Fold CV R² = {cv_r2.mean():.4f} ± {cv_r2.std():.4f}",
+         ha='left', va='top', transform=plt.gca().transAxes, fontsize=11)
+plt.legend(loc='lower right')
+plt.grid(False)
+plt.tight_layout()
+plt.savefig(os.path.join(folder, "pred_vs_obs.jpg"), dpi=300, bbox_inches='tight')
+plt.close()
+
+# ==================== 6. SHAP 分析（强化生态机制解释） ====================
+print("\n" + "="*50)
+print("【阶段五】SHAP 可解释性分析")
+
+explainer = shap.TreeExplainer(best_model)
+shap_vals = explainer.shap_values(X_test_final)
+base_val = explainer.expected_value
+
+# 6.1 SHAP 特征重要性
+importance_shap = np.abs(shap_vals).mean(axis=0)
+imp_df = pd.DataFrame({
+    'Feature': final_features,
+    'Mean_|SHAP|': importance_shap,
+    'Rank': range(1, len(final_features)+1)
+}).sort_values('Mean_|SHAP|', ascending=False)
+imp_df.to_csv(os.path.join(folder, "feature_importance_shap.csv"), index=False)
+
+# 6.3 生成生态机制解释报告
+eco_report = "SHAP 特征重要性与生态机制解释报告\n"
+eco_report += "="*70 + "\n\n"
+eco_report += "【分析说明】本报告基于 SHAP (SHapley Additive exPlanations) 值，量化各环境因子对干旱概率(prob_2YM)的贡献，\n"
+eco_report += "并结合生态水文学与陆面过程机理，阐释统计关联背后的生物物理机制。\n\n"
+
+for rank, row in imp_df.iterrows():
+    f = row['Feature']
+    info = eco_knowledge.get(f, {})
+    eco_report += f"【排名 {int(row['Rank'])}】{f} — {info.get('full_name', '')}\n"
+    eco_report += f"  平均 |SHAP| 值: {row['Mean_|SHAP|']:.6f}\n"
+    eco_report += f"  生态机制: {info.get('mechanism', '待补充')}\n"
+    eco_report += f"  关键交互: {info.get('key_interaction', '待补充')}\n\n"
+
+eco_path = os.path.join(folder, "eco_interpretation.txt")
+with open(eco_path, "w", encoding="utf-8") as f:
+    f.write(eco_report)
+print(f"生态解释报告已保存: {eco_path}")
+
+# 6.4 SHAP 可视化
+# Summary violin
+shap.summary_plot(shap_vals, X_test_final, plot_type="violin", show=False)
+plt.savefig(os.path.join(folder, "shap_violin.jpg"), dpi=300, bbox_inches='tight')
+plt.close()
+
+# Summary bar
+shap.summary_plot(shap_vals, X_test_final, plot_type="bar", show=False)
+plt.savefig(os.path.join(folder, "shap_bar.jpg"), dpi=300, bbox_inches='tight')
+plt.close()
+
+# Waterfall (第一个样本)
+expl = shap.Explanation(
+    values=shap_vals[0],
+    base_values=base_val,
+    data=X_test_final.iloc[0].values,
+    feature_names=final_features
+)
+shap.plots.waterfall(expl, show=False)
+plt.savefig(os.path.join(folder, "shap_waterfall.jpg"), dpi=300, bbox_inches='tight')
+plt.close()
+
+# Dependence plots (带生态标题)
+for f in tqdm(final_features, desc="Dependence plots"):
+    plt.figure(figsize=(7, 5))
+    shap.dependence_plot(f, shap_vals, X_test_final, show=False)
+    plt.title(f"SHAP Dependence: {f} ({eco_knowledge[f]['full_name']})", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(os.path.join(folder, f"dependence_{f}.jpg"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+# Polynomial fit plots (带生态注释)
+for i, f in enumerate(tqdm(final_features, desc="Poly fit plots")):
+    plt.figure(figsize=(7, 5))
+    sns.regplot(
+        x=X_test_final[f], y=shap_vals[:, i], order=2,
+        scatter_kws={'alpha': 0.2, 's': 10},
+        line_kws={'color': 'red', 'linewidth': 2}
+    )
+    plt.xlabel(f"{f} ({eco_knowledge[f]['full_name']})", fontsize=11)
+    plt.ylabel(f"SHAP value of {f}", fontsize=11)
+    plt.title(f"Nonlinear effect: {f} on drought probability", fontsize=11)
+    plt.grid(False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(folder, f"poly_fit_{f}.jpg"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+# 6.5 交互作用分析（针对 Top-3 重要特征的两两组合）
+print("\n分析 Top-3 特征的交互作用...")
+top3 = imp_df.head(3)['Feature'].tolist()
+
+for f1, f2 in combinations(top3, 2):
+    plt.figure(figsize=(7, 5))
+    shap.dependence_plot(f1, shap_vals, X_test_final, interaction_index=f2, show=False)
+    plt.title(f"Interaction: {f1} × {f2}\n({eco_knowledge[f1]['full_name']} vs {eco_knowledge[f2]['full_name']})",
+              fontsize=10)
+    plt.tight_layout()
+    plt.savefig(os.path.join(folder, f"interaction_{f1}_{f2}.jpg"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+print(f"\n{'='*50}")
+print(f"全部结果已保存至: {folder}")
+print("="*50)
